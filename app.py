@@ -20,7 +20,19 @@ from pydantic import BaseModel
 
 # ── Configuration ───────────────────────────────────────────────────────────
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-MODELE = os.environ.get("PULSE_MODEL", "nex-agi/nex-n2.5-pro:free")
+DEEPSEEK_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+
+# Modele par defaut : DeepSeek en direct. ~5 s pour un document complet,
+# contre 240 s+ pour l'ancien modele gratuit « nex-n2.5-pro » (expiration).
+MODELE = os.environ.get("PULSE_MODEL", "deepseek-chat")
+# Repli OpenRouter si la cle DeepSeek n'est pas configuree (modele rapide).
+MODELE_OPENROUTER = os.environ.get("PULSE_OPENROUTER_MODEL", "nex-agi/nex-n2.5-mini:free")
+
+# 1400 tokens suffisent largement pour un document publiable (l'ancien defaut
+# de 3500 ne faisait qu'allonger l'attente). L'apercu s'arrete a ~2200
+# caracteres : 800 tokens de sortie suffisent donc pour un extrait.
+MAX_TOKENS = int(os.environ.get("PULSE_MAX_TOKENS", "1400"))
+MAX_TOKENS_APERCU = int(os.environ.get("PULSE_MAX_TOKENS_APERCU", "800"))
 
 PAYPAL_CLIENT_ID = os.environ.get("PAYPAL_CLIENT_ID", "")
 PAYPAL_SECRET = os.environ.get("PAYPAL_SECRET", "")
@@ -108,35 +120,54 @@ CONSIGNES :
 
 
 # ── Appel modele ────────────────────────────────────────────────────────────
-def generer(doc_key: str, infos: dict) -> str:
-    if doc_key not in DOCUMENTS:
-        raise HTTPException(400, "Document inconnu")
-    if not OPENROUTER_KEY:
-        raise HTTPException(503, "Generation indisponible")
-
-    prompt = PROMPT.format(titre=DOCUMENTS[doc_key]["titre"], **infos)
+def _appel(url: str, cle: str, modele: str, prompt: str, max_tokens: int,
+           timeout: int = 55) -> str:
+    """Un aller-retour avec une API compatible OpenAI. Leve en cas d'echec."""
     corps = json.dumps({
-        "model": MODELE,
+        "model": modele,
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 3500,
+        "max_tokens": max_tokens,
         "temperature": 0.2,
     }).encode()
 
     req = urllib.request.Request(
-        "https://openrouter.ai/api/v1/chat/completions",
-        data=corps,
-        headers={"Authorization": f"Bearer {OPENROUTER_KEY}",
+        url, data=corps,
+        headers={"Authorization": f"Bearer {cle}",
                  "Content-Type": "application/json"},
     )
-    try:
-        with urllib.request.urlopen(req, timeout=150) as r:
-            d = json.load(r)
-    except Exception as e:
-        raise HTTPException(502, f"Erreur de generation : {type(e).__name__}")
-
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        d = json.load(r)
     if "choices" not in d:
-        raise HTTPException(502, "Reponse inattendue du modele")
+        raise RuntimeError("reponse inattendue")
     return d["choices"][0]["message"]["content"].strip()
+
+
+def generer(doc_key: str, infos: dict, max_tokens: Optional[int] = None) -> str:
+    if doc_key not in DOCUMENTS:
+        raise HTTPException(400, "Document inconnu")
+    if not DEEPSEEK_KEY and not OPENROUTER_KEY:
+        raise HTTPException(503, "Generation indisponible")
+
+    mt = max_tokens or MAX_TOKENS
+    prompt = PROMPT.format(titre=DOCUMENTS[doc_key]["titre"], **infos)
+
+    erreurs = []
+    # 1) DeepSeek en direct : rapide et fiable (recommande en production).
+    if DEEPSEEK_KEY:
+        try:
+            return _appel("https://api.deepseek.com/chat/completions",
+                          DEEPSEEK_KEY, MODELE, prompt, mt)
+        except Exception as e:
+            erreurs.append(f"deepseek:{type(e).__name__}")
+    # 2) Repli OpenRouter.
+    if OPENROUTER_KEY:
+        try:
+            return _appel("https://openrouter.ai/api/v1/chat/completions",
+                          OPENROUTER_KEY, MODELE_OPENROUTER, prompt, mt)
+        except Exception as e:
+            erreurs.append(f"openrouter:{type(e).__name__}")
+
+    raise HTTPException(502, "Erreur de generation : " + (", ".join(erreurs) or "aucun modele disponible"))
 
 
 # ── Licence (abonnement) ────────────────────────────────────────────────────
@@ -222,13 +253,16 @@ def api_preview(doc_key: str):
         "site": "ma-boutique.fr", "vente": "oui", "donnees": "oui", "cookies": "oui",
         "paiement": "carte bancaire", "livraison": "Colissimo, 3-5 jours",
     }
-    texte = generer(doc_key, infos)
+    texte = generer(doc_key, infos, max_tokens=MAX_TOKENS_APERCU)
     return {"titre": DOCUMENTS[doc_key]["titre"], "contenu": texte[:2200]}
 
 
 @app.get("/sante")
 def sante():
-    return {"ok": True, "modele": MODELE, "docs": len(DOCUMENTS)}
+    return {"ok": True, "modele": MODELE,
+            "fournisseur": "deepseek" if DEEPSEEK_KEY else "openrouter",
+            "repli_openrouter": bool(OPENROUTER_KEY),
+            "docs": len(DOCUMENTS)}
 
 
 # ── Page ────────────────────────────────────────────────────────────────────
