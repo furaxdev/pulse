@@ -137,9 +137,12 @@ def _appel(url: str, cle: str, modele: str, prompt: str, max_tokens: int,
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:
         d = json.load(r)
-    if "choices" not in d:
+    if "choices" not in d or not d["choices"]:
         raise RuntimeError("reponse inattendue")
-    return d["choices"][0]["message"]["content"].strip()
+    contenu = d["choices"][0].get("message", {}).get("content") or ""
+    if not contenu.strip():
+        raise RuntimeError("reponse vide du modele")
+    return contenu.strip()
 
 
 def generer(doc_key: str, infos: dict, max_tokens: Optional[int] = None) -> str:
